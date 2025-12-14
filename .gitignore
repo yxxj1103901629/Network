@@ -1,0 +1,90 @@
+# ----------------------------------------------------------------------------
+# Qt / C++ 项目忽略文件
+# ----------------------------------------------------------------------------
+
+# 构建目录
+debug/
+release/
+build/
+build-*/
+
+# Qt Creator / qmake 生成文件
+*.qtc_clangd/      
+*.pro.user*       
+*.pro.user.*      
+*.qmake.cache     
+*.qmake.stash     
+*.autosave        
+Makefile*         
+*.prl             
+
+# CMake 生成文件
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CMakeScripts/
+CTestTestfile.cmake
+*.cmake.user
+
+# Qt 自动生成代码
+moc_*.cpp         
+ui_*.h            
+qrc_*.cpp         
+*_pch.h.cpp       
+*_resource.rc 
+
+# 编译输出（目标文件 / 库 / 可执行文件）
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+# *.dll
+*.exe
+*.app
+# *.lib
+*.lo
+*.la
+*.lai
+
+# Debug / Release 产物
+*.debug
+*.release
+*.ipch
+*.iobj
+
+# Visual Studio 生成文件
+*.vs/
+*.qtvscr
+*.vcxproj.*
+*.sln
+*.suo
+*.vcxproj
+*.vcxproj.user
+*.vcproj.*
+*.ncb
+*.sdf
+*.opensdf
+*.idb
+*.ilk
+# *.pdb
+*.exp
+*.ib_pdb_index
+
+# MinGW 构建目录
+*.Debug
+*.Release
+
+# 临时文件 / 备份文件
+*~
+*.swp
+.*.swp
+*.flc
+*.orig
+*.rej
+*.*#
+.#*
+*.tmp
+*.bak
+*.log
+*.dmp
