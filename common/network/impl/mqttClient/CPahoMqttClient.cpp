@@ -1,29 +1,27 @@
 #include "CPahoMqttClient.h"
-#include <iostream>
+
+#include <atomic>
 
 using namespace Common::Network;
 
 // MQTT回调处理类实现
-void CPahoMqttClient::MqttCallback::connected(const std::string &)
+void CPahoMqttClient::MqttCallback::connected(const std::string &cause)
 {
-    std::cout << "MQTT connected callback triggered." << std::endl;
-    m_parent->updateConnected(true);
-    std::cout << "MQTT client connected successfully." << std::endl;
+    m_parent->m_connected.store(true);
 
     // 调用用户提供的连接回调，无需持有锁
     if (m_parent->m_connectCallback) {
-        m_parent->m_connectCallback(true);
+        m_parent->m_connectCallback(true, cause);
     }
 }
 
-void CPahoMqttClient::MqttCallback::connection_lost(const std::string &)
+void CPahoMqttClient::MqttCallback::connection_lost(const std::string &cause)
 {
-    std::cout << "MQTT connection lost callback triggered." << std::endl;
-    m_parent->updateConnected(false);
+    m_parent->m_connected.store(false);
 
-    // 调用用户提供的连接回调，无需持有锁
-    if (m_parent->m_connectCallback) {
-        m_parent->m_connectCallback(false);
+    // 调用用户提供的断开连接回调，无需持有锁
+    if (m_parent->m_disconnectCallback) {
+        m_parent->m_disconnectCallback(true, cause);
     }
 }
 
@@ -41,25 +39,33 @@ void CPahoMqttClient::MqttCallback::message_arrived(mqtt::const_message_ptr msg)
     }
 }
 
-void CPahoMqttClient::MqttCallback::delivery_complete(mqtt::delivery_token_ptr)
+void CPahoMqttClient::MqttCallback::delivery_complete(mqtt::delivery_token_ptr token)
 {
-    std::cout << "MQTT delivery complete callback triggered." << std::endl;
-    // 消息发送完成，无需特殊处理
+    bool success = token && token->is_complete();
+    std::string info = success ? "Delivery complete" : "Delivery failed";
+
+    if (m_parent->m_publishCallback) {
+        m_parent->m_publishCallback(success, info);
+    }
 }
 
 // CPahoMqttClient类实现
 CPahoMqttClient::CPahoMqttClient()
     : m_client(nullptr)
     , m_callback(this)
-    , m_recvCallback(nullptr)
-    , m_connectCallback(nullptr)
     , m_connected(false)
 {}
 
 CPahoMqttClient::~CPahoMqttClient()
 {
-    disconnect();
+    // 直接清理资源
     if (m_client) {
+        try {
+            // 尝试同步断开连接
+            m_client->disconnect()->wait_for(std::chrono::milliseconds(100));
+        } catch (...) {
+            // 忽略任何异常
+        }
         delete m_client;
         m_client = nullptr;
     }
@@ -80,13 +86,20 @@ bool CPahoMqttClient::init(const std::string &broker, const std::string &clientI
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_client) {
+                try {
+                    m_client->disconnect()->wait_for(std::chrono::milliseconds(100));
+                } catch (...) {
+                    // 忽略任何异常
+                }
                 delete m_client;
             }
             m_client = newClient;
         }
         return true;
     } catch (const mqtt::exception &exc) {
-        std::cerr << "Failed to initialize MQTT client: " << exc.what() << std::endl;
+        if (m_publishCallback) {
+            m_publishCallback(false, std::string("Failed to initialize MQTT client: ") + exc.what());
+        }
         return false;
     }
 }
@@ -97,15 +110,15 @@ void CPahoMqttClient::connect(ConnectCallback callback,
 {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_connectCallback = callback;
+        m_connectCallback = std::move(callback);
         m_username = username;
         m_password = password;
     }
 
     if (!m_client) {
-        std::cerr << "MQTT client not initialized, please call init() first" << std::endl;
-        if (callback) {
-            callback(false);
+        const std::string info = "MQTT client not initialized, please call init() first";
+        if (m_connectCallback) {
+            m_connectCallback(false, info);
         }
         return;
     }
@@ -126,83 +139,98 @@ void CPahoMqttClient::connect(ConnectCallback callback,
         m_client->connect(connOpts);
 
     } catch (const mqtt::exception &exc) {
-        std::cerr << "Failed to connect to MQTT server: " << exc.what() << std::endl;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_connected = false;
-        }
-
-        if (callback) {
-            callback(false);
+        m_connected.store(false);
+        const std::string info = std::string("Failed to connect MQTT: ") + exc.what();
+        if (m_connectCallback) {
+            m_connectCallback(false, info);
         }
     }
 }
 
 bool CPahoMqttClient::disconnect()
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_client && m_connected) {
-        try {
-            // 使用异步断开连接方式
-            m_client->disconnect();
-            m_connected = false;
-            return true;
-        } catch (const mqtt::exception &exc) {
-            std::cerr << "Failed to disconnect MQTT: " << exc.what() << std::endl;
-            return false;
-        }
-    } else {
+    if (!m_client) {
         return true;
+    }
+
+    try {
+        // 使用异步断开连接方式
+        m_client->disconnect();
+        m_connected.store(false);
+        return true;
+    } catch (const mqtt::exception &exc) {
+        if (m_disconnectCallback) {
+            m_disconnectCallback(false, std::string("Failed to disconnect MQTT: ") + exc.what());
+        }
+        return false;
     }
 }
 
 bool CPahoMqttClient::isConnected() const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_connected;
-}
-
-void CPahoMqttClient::updateConnected(bool connected)
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_connected = connected;
+    return m_connected.load();
 }
 
 void CPahoMqttClient::subscribe(const std::string &topic, int qos)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_client) {
-        std::cerr << "MQTT client not initialized, please call init() first" << std::endl;
+        if (m_subscribeCallback) {
+            m_subscribeCallback(false, "MQTT client not initialized");
+        }
         return;
     }
-    if (!m_connected) {
-        std::cerr << "MQTT client is not connected, cannot subscribe to topic" << std::endl;
+
+    if (!m_connected.load()) {
+        if (m_subscribeCallback) {
+            m_subscribeCallback(false, "MQTT client is not connected");
+        }
         return;
     }
+
     try {
         // 使用异步订阅方式
         m_client->subscribe(topic, qos);
+
+        if (m_subscribeCallback) {
+            m_subscribeCallback(true, "Subscribe successful");
+        }
     } catch (const mqtt::exception &exc) {
-        std::cerr << "Failed to subscribe to MQTT topic: " << exc.what() << std::endl;
+        if (m_subscribeCallback) {
+            m_subscribeCallback(false,
+                                std::string("Failed to subscribe to MQTT topic: ") + exc.what());
+        }
     }
 }
 
 void CPahoMqttClient::unsubscribe(const std::string &topic)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_client) {
-        std::cerr << "MQTT client not initialized, please call init() first" << std::endl;
+        if (m_unsubscribeCallback) {
+            m_unsubscribeCallback(false, "MQTT client not initialized");
+        }
         return;
     }
-    if (!m_connected) {
-        std::cerr << "MQTT client is not connected, cannot unsubscribe from topic" << std::endl;
+
+    if (!m_connected.load()) {
+        if (m_unsubscribeCallback) {
+            m_unsubscribeCallback(false, "MQTT client is not connected");
+        }
         return;
     }
+
     try {
         // 使用异步取消订阅方式
         m_client->unsubscribe(topic);
+
+        if (m_unsubscribeCallback) {
+            m_unsubscribeCallback(true, "Unsubscribe successful");
+        }
     } catch (const mqtt::exception &exc) {
-        std::cerr << "Failed to unsubscribe from MQTT topic: " << exc.what() << std::endl;
+        if (m_unsubscribeCallback) {
+            m_unsubscribeCallback(false,
+                                  std::string("Failed to unsubscribe from MQTT topic: ")
+                                      + exc.what());
+        }
     }
 }
 
@@ -211,13 +239,17 @@ bool CPahoMqttClient::publish(const std::string &topic,
                               int qos,
                               bool retained)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_client) {
-        std::cerr << "MQTT client not initialized, please call init() first" << std::endl;
+        if (m_publishCallback) {
+            m_publishCallback(false, "MQTT client not initialized");
+        }
         return false;
     }
-    if (!m_connected) {
-        std::cerr << "MQTT client is not connected, cannot publish message" << std::endl;
+
+    if (!m_connected.load()) {
+        if (m_publishCallback) {
+            m_publishCallback(false, "MQTT client is not connected");
+        }
         return false;
     }
 
@@ -227,12 +259,44 @@ bool CPahoMqttClient::publish(const std::string &topic,
         m_client->publish(pubmsg);
         return true;
     } catch (const mqtt::exception &exc) {
-        std::cerr << "Failed to publish MQTT message: " << exc.what() << std::endl;
+        if (m_publishCallback) {
+            m_publishCallback(false, std::string("Failed to publish MQTT message: ") + exc.what());
+        }
         return false;
     }
 }
 
-void CPahoMqttClient::setRecvCallback(RecvCallback callback)
+// 设置回调函数的实现
+void CPahoMqttClient::setConnectCallback(ConnectCallback &&callback)
+{
+    m_connectCallback = std::move(callback);
+}
+
+void CPahoMqttClient::setDisconnectCallback(DisconnectCallback &&callback)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_disconnectCallback = std::move(callback);
+}
+
+void CPahoMqttClient::setPublishCallback(PublishCallback &&callback)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_publishCallback = std::move(callback);
+}
+
+void CPahoMqttClient::setSubscribeCallback(SubscribeCallback &&callback)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_subscribeCallback = std::move(callback);
+}
+
+void CPahoMqttClient::setUnsubscribeCallback(UnsubscribeCallback &&callback)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_unsubscribeCallback = std::move(callback);
+}
+
+void CPahoMqttClient::setRecvCallback(RecvCallback &&callback)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_recvCallback = std::move(callback);

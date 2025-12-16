@@ -1,7 +1,6 @@
 #include "CUVLoop.h"
 #include "concurrentqueue.h"
 #include <functional>
-#include <iostream>
 
 using namespace Common::Network;
 
@@ -50,7 +49,7 @@ CUVLoop::~CUVLoop()
         m_workerThread = nullptr;
     }
 
-    std::cout << "CUVLoop: Event loop stopped and resources cleaned up." << std::endl;
+    // std::cout << "CUVLoop: Event loop stopped and resources cleaned up." << std::endl;
 }
 
 // 内部工作线程函数
@@ -97,7 +96,7 @@ void CUVLoop::workerThread(void *arg)
 
     // 检查初始化结果
     if (exitInitResult != 0 || workInitResult != 0) {
-        std::cerr << "CUVLoop: Failed to initialize async handles" << std::endl;
+        // std::cerr << "CUVLoop: Failed to initialize async handles" << std::endl;
         delete loop->m_loop;
         loop->m_loop = nullptr;
         loop->m_isStopping = true;
@@ -110,8 +109,6 @@ void CUVLoop::workerThread(void *arg)
         }
         return;
     }
-
-    std::cout << "CUVLoop: Event loop started in worker thread." << std::endl;
 
     // 标记loop已经初始化完成，通知主线程继续执行
     {

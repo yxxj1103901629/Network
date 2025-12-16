@@ -1,7 +1,7 @@
 #include "CUVTcpClient.h"
 #include "common/network/base/CUVLoop.h"
 #include <cstring>
-#include <iostream>
+// #include <iostream>
 #include <uv.h>
 
 using namespace Common::Network;
@@ -22,11 +22,20 @@ struct SendRequest
     CUVTcpClient::SendCallback callback;
 };
 
+// 删除定时器
+void deleteTimer(uv_timer_t* timer)
+{
+    if (timer && !uv_is_closing(reinterpret_cast<uv_handle_t*>(timer))) {
+        uv_timer_stop(timer);
+        uv_close(reinterpret_cast<uv_handle_t*>(timer),
+                 [](uv_handle_t* handle) { delete reinterpret_cast<uv_timer_t*>(handle); });
+    }
+}
+
 // 构造函数
 CUVTcpClient::CUVTcpClient()
     : m_loop(CUVLoop::getInstance())
     , m_tcpHandle(nullptr)
-    , m_callback(this)
     , m_state(ConnectState::DISCONNECTED)
     , m_host("")
     , m_port(0)
@@ -41,40 +50,55 @@ CUVTcpClient::CUVTcpClient()
 // 析构函数
 CUVTcpClient::~CUVTcpClient()
 {
-    // 延迟清理TCP句柄，确保在事件循环线程中执行
+    // 清理TCP句柄
     if (m_tcpHandle) {
         auto tcpHandle = m_tcpHandle;
         m_tcpHandle = nullptr;
 
-        if (m_loop) {
-            m_loop->postTask([tcpHandle]() {
+        if (isLoopValid()) {
+            postTask([tcpHandle]() {
                 uv_read_stop(reinterpret_cast<uv_stream_t*>(tcpHandle));
-                uv_close(reinterpret_cast<uv_handle_t*>(tcpHandle), [](uv_handle_t* handle) {
-                    // 清理TCP句柄
-                    delete reinterpret_cast<uv_tcp_t*>(handle);
-                    handle = nullptr;
-                });
+                uv_close(reinterpret_cast<uv_handle_t*>(tcpHandle),
+                         [](uv_handle_t* handle) { delete reinterpret_cast<uv_tcp_t*>(handle); });
             });
         } else {
-            // 如果没有事件循环，直接清理
             delete tcpHandle;
-            tcpHandle = nullptr;
+        }
+    }
+    // 清理重连定时器
+    if (m_reconnectTimer) {
+        auto reconnectTimer = m_reconnectTimer;
+        m_reconnectTimer = nullptr;
+
+        if (isLoopValid()) {
+            postTask([reconnectTimer]() {
+                deleteTimer(reconnectTimer);
+            });
+        } else {
+            delete reconnectTimer;
+        }
+    }
+    // 清理接收超时定时器
+    if (m_receiveTimeoutTimer) {
+        auto receiveTimeoutTimer = m_receiveTimeoutTimer;
+        m_receiveTimeoutTimer = nullptr;
+
+        if (isLoopValid()) {
+            postTask([receiveTimeoutTimer]() {
+                deleteTimer(receiveTimeoutTimer);
+            });
+        } else {
+            delete receiveTimeoutTimer;
         }
     }
 
-    // 清除重连定时器
-    stopReconnectTimer();
-
-    // 清除接收超时定时器
-    stopReceiveTimeoutTimer();
-
-    std::cout << "CUVTcpClient: Destructor called, resources cleaned up." << std::endl;
+    // std::cout << "CUVTcpClient destroyed." << std::endl;
 }
 
 // 连接服务器
 void CUVTcpClient::connect(const std::string& host, int port)
 {
-    if (!m_loop) {
+    if (!isLoopValid()) {
         if (m_connectCallback) {
             m_connectCallback(false, "Invalid loop");
         }
@@ -82,7 +106,7 @@ void CUVTcpClient::connect(const std::string& host, int port)
     }
 
     // 确保在事件循环线程中执行连接操作
-    m_loop->postTask([this, host, port]() {
+    postTask([this, host, port]() {
         // 检查当前状态
         if (m_state.load() != ConnectState::DISCONNECTED) {
             if (m_connectCallback) {
@@ -96,21 +120,19 @@ void CUVTcpClient::connect(const std::string& host, int port)
         m_host = host;
         m_port = port;
 
-        // 创建TCP句柄
+        // 创建并初始化TCP句柄
         if (!m_tcpHandle) {
             m_tcpHandle = new uv_tcp_t;
             std::memset(m_tcpHandle, 0, sizeof(uv_tcp_t));
             m_tcpHandle->data = this;
 
-            // 初始化TCP句柄
-            int result = uv_tcp_init(m_loop->getLoop(), m_tcpHandle);
-            if (result != 0) {
+            if (uv_tcp_init(m_loop->getLoop(), m_tcpHandle) != 0) {
                 m_state.store(ConnectState::DISCONNECTED);
                 if (m_connectCallback) {
-                    m_connectCallback(false,
-                                      "Failed to initialize TCP handle: "
-                                          + std::string(uv_strerror(result)));
+                    m_connectCallback(false, "Failed to initialize TCP handle");
                 }
+                delete m_tcpHandle;
+                m_tcpHandle = nullptr;
                 return;
             }
         }
@@ -142,20 +164,18 @@ void CUVTcpClient::connect(const std::string& host, int port)
         result = uv_tcp_connect(req,
                                 m_tcpHandle,
                                 reinterpret_cast<const struct sockaddr*>(&addr),
-                                [](uv_connect_t* req, int status) {
-                                    ConnectRequest* req_data = static_cast<ConnectRequest*>(
-                                        req->data);
-                                    CUVTcpClient* client = req_data->client;
-                                    client->m_callback.onConnect(req, status);
-                                });
+                                CUVTcpClient::onConnect);
         if (result != 0) {
             delete req;
             delete req_data;
+
+            // 更新状态为DISCONNECTED
+            m_state.store(ConnectState::DISCONNECTED);
+
             if (m_connectCallback) {
                 m_connectCallback(false, "Failed to connect: " + std::string(uv_strerror(result)));
             }
 
-            m_state.store(ConnectState::DISCONNECTED);
             // 启动重连定时器
             startReconnectTimer();
             return;
@@ -166,33 +186,42 @@ void CUVTcpClient::connect(const std::string& host, int port)
 // 断开连接
 void CUVTcpClient::disconnect()
 {
-    if (!m_loop) {
-        std::cout << "CUVTcpClient: Invalid loop, cannot disconnect." << std::endl;
+    // 确保在事件循环线程中执行断开操作
+    if (!isLoopValid()) {
+        if (m_disconnectCallback) {
+            m_disconnectCallback(false, "Invalid loop");
+        }
         return;
     }
 
-    if (!m_tcpHandle) {
-        std::cout << "CUVTcpClient: No active connection to disconnect." << std::endl;
+    // 检查当前状态
+    if (m_state.load() == ConnectState::DISCONNECTED) {
+        if (m_disconnectCallback) {
+            m_disconnectCallback(true, "Client already disconnected");
+        }
         return;
     }
+    m_state.store(ConnectState::DISCONNECTED);
 
+    // 保存当前句柄和定时器指针，避免在回调中被修改
     auto tcpHandle = m_tcpHandle;
     m_tcpHandle = nullptr;
+    auto receiveTimeoutTimer = m_receiveTimeoutTimer;
+    m_receiveTimeoutTimer = nullptr;
+    auto reconnectTimer = m_reconnectTimer;
+    m_reconnectTimer = nullptr;
+    // 在事件循环线程中执行断开操作
+    postTask([tcpHandle, receiveTimeoutTimer, reconnectTimer]() {
+        // 关闭接收超时定时器
+        deleteTimer(receiveTimeoutTimer);
 
-    m_loop->postTask([this, tcpHandle]() {
-        if (m_state.load() == ConnectState::DISCONNECTED) {
-            return;
-        }
-        // 更新状态
-        m_state.store(ConnectState::DISCONNECTED);
+        // 停止重连定时器，避免重复连接
+        deleteTimer(reconnectTimer);
 
-        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(tcpHandle))) {
+        // 关闭TCP连接
+        if (tcpHandle) {
             uv_read_stop(reinterpret_cast<uv_stream_t*>(tcpHandle));
-            uv_close(reinterpret_cast<uv_handle_t*>(tcpHandle), [](uv_handle_t* handle) {
-                if (CUVTcpClient* client = static_cast<CUVTcpClient*>(handle->data)) {
-                    client->m_callback.onDisconnect(handle);
-                }
-            });
+            uv_close(reinterpret_cast<uv_handle_t*>(tcpHandle), onDisconnect);
         }
     });
 }
@@ -207,35 +236,32 @@ CUVTcpClient::ConnectState CUVTcpClient::getState() const
 void CUVTcpClient::send(const char* data, size_t length, SendCallback&& callback)
 {
     if (!data || length == 0) {
-        if (callback) {
-            callback(false, "Invalid data");
-        }
+        callback(false, "Invalid data");
         return;
     }
 
-    std::string str_data(data, length);
-    send(str_data, std::move(callback));
+    send(std::string(data, length), std::move(callback));
 }
 
 // 发送数据（string版本）
-void CUVTcpClient::send(const std::string& data, SendCallback&& callback)
+void CUVTcpClient::send(const std::string& data, SendCallback&& sendCallback)
 {
     if (data.empty()) {
-        if (callback) {
-            callback(false, "Empty data");
+        if (sendCallback) {
+            sendCallback(false, "Empty data");
         }
         return;
     }
 
-    if (!m_loop) {
-        if (callback) {
-            callback(false, "Invalid loop");
+    if (!isLoopValid()) {
+        if (sendCallback) {
+            sendCallback(false, "Invalid loop");
         }
         return;
     }
 
     // 确保在事件循环线程中执行发送操作
-    m_loop->postTask([this, data, callback]() {
+    postTask([this, data, callback = std::move(sendCallback)]() {
         if (m_state.load() != ConnectState::CONNECTED) {
             if (callback) {
                 callback(false, "Client is not connected");
@@ -245,15 +271,14 @@ void CUVTcpClient::send(const std::string& data, SendCallback&& callback)
 
         // 检查写队列大小
         if (uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(m_tcpHandle))
-            > 1024 * 1024) { // 1MB限制
-            // 写队列过大，重新连接
+            > 1024 * 1024) {
+            std::string error_msg = "Write queue is too large, reconnecting...";
             if (callback) {
-                callback(false, "Write queue is too large, reconnecting...");
+                callback(false, error_msg);
             }
 
-            // 断开当前连接
+            // 断开连接并启动重连定时器
             disconnect();
-            // 启动重连定时器
             startReconnectTimer();
             return;
         }
@@ -274,11 +299,7 @@ void CUVTcpClient::send(const std::string& data, SendCallback&& callback)
                               reinterpret_cast<uv_stream_t*>(m_tcpHandle),
                               &buf,
                               1,
-                              [](uv_write_t* req, int status) {
-                                  SendRequest* req_data = static_cast<SendRequest*>(req->data);
-                                  CUVTcpClient* client = req_data->client;
-                                  client->m_callback.onSend(req, status);
-                              });
+                              CUVTcpClient::onSend);
         if (result != 0) {
             if (req_data->callback) {
                 req_data->callback(false,
@@ -293,21 +314,26 @@ void CUVTcpClient::send(const std::string& data, SendCallback&& callback)
 // ==================== 回调设置方法 ====================
 
 // 设置接收回调
-void CUVTcpClient::setReceiveCallback(ReceiveCallback callback)
+void CUVTcpClient::setReceiveCallback(ReceiveCallback&& callback)
 {
-    m_receiveCallback = callback;
+    m_receiveCallback = std::move(callback);
 }
 
 // 设置连接回调
-void CUVTcpClient::setConnectCallback(ConnectCallback callback)
+void CUVTcpClient::setConnectCallback(ConnectCallback&& callback)
 {
-    m_connectCallback = callback;
+    m_connectCallback = std::move(callback);
 }
 
 // 设置断开回调
-void CUVTcpClient::setDisconnectCallback(DisconnectCallback callback)
+void CUVTcpClient::setDisconnectCallback(DisconnectCallback&& callback)
 {
-    m_disconnectCallback = callback;
+    m_disconnectCallback = std::move(callback);
+}
+
+void CUVTcpClient::setReconnectCallback(ReconnectCallback&& callback)
+{
+    m_reconnectCallback = std::move(callback);
 }
 
 // 设置重连间隔
@@ -325,67 +351,59 @@ void CUVTcpClient::setReceiveTimeout(int timeoutMs, TimeoutCallback callback)
 {
     m_receiveTimeoutInterval = timeoutMs;
     m_receiveTimeoutCallback = callback;
+    if (timeoutMs <= 0) {
+        // 停止接收超时定时器
+        stopReceiveTimeoutTimer();
+    } else {
+        // 重置接收超时定时器
+        stopReceiveTimeoutTimer();
+        startReceiveTimeoutTimer();
+    }
 }
 
 // ==================== 重连定时器相关方法 ====================
 
 void CUVTcpClient::startReconnectTimer()
 {
-    if (!m_loop) {
+    if (!isLoopValid()) {
         return;
     }
 
-    m_loop->postTask([this]() {
+    postTask([this]() {
         if (m_state.load() != ConnectState::DISCONNECTED) {
             return;
         }
 
-        // 初始化重连定时器
-        if (!m_reconnectTimer) {
-            m_reconnectTimer = new uv_timer_t;
-            std::memset(m_reconnectTimer, 0, sizeof(uv_timer_t));
-            m_reconnectTimer->data = this;
-            if (int result = uv_timer_init(m_loop->getLoop(), m_reconnectTimer); result != 0) {
-                delete m_reconnectTimer;
-                m_reconnectTimer = nullptr;
-                std::cerr << "CUVTcpClient: Failed to initialize reconnect timer: "
-                          << uv_strerror(result) << std::endl;
-                return;
-            }
-        };
-
-        // 启动重连定时器
-        uv_timer_start(
-            m_reconnectTimer,
+        // 使用通用定时器管理函数启动重连定时器
+        startTimer(
+            &m_reconnectTimer,
+            m_reconnectInterval,
             [](uv_timer_t* handle) {
                 CUVTcpClient* client = static_cast<CUVTcpClient*>(handle->data);
 
-                std::cout << "CUVTcpClient: Attempting to reconnect to " << client->m_host << ":"
-                          << client->m_port << " ..." << std::endl;
-
-                client->connect(client->m_host, client->m_port);
+                if (client->m_state.load() == ConnectState::DISCONNECTED) {
+                    if (client->m_reconnectCallback) {
+                        client->m_reconnectCallback("Attempting to reconnect to " + client->m_host
+                                                    + ":" + std::to_string(client->m_port));
+                    }
+                    client->connect(client->m_host, client->m_port);
+                }
             },
-            m_reconnectInterval, // 延迟
-            0);                  // 不重复
+            "Failed to initialize reconnect timer: ",
+            "Failed to start reconnect timer: ",
+            m_reconnectCallback);
     });
 }
 
 void CUVTcpClient::stopReconnectTimer()
 {
-    if (!m_loop || !m_reconnectTimer) {
+    if (!isLoopValid() || !m_reconnectTimer) {
         return;
     }
 
-    m_loop->postTask([this]() {
+    postTask([this]() {
         if (m_reconnectTimer) {
-            auto reconnectTimer = m_reconnectTimer;
-            m_reconnectTimer = nullptr;
-
-            uv_timer_stop(reconnectTimer);
-            uv_close(reinterpret_cast<uv_handle_t*>(reconnectTimer), [](uv_handle_t* handle) {
-                delete reinterpret_cast<uv_timer_t*>(handle);
-                handle = nullptr;
-            });
+            uv_timer_stop(m_reconnectTimer);
         }
     });
 }
@@ -394,108 +412,138 @@ void CUVTcpClient::stopReconnectTimer()
 
 void CUVTcpClient::startReceiveTimeoutTimer()
 {
-    if (!m_loop || m_receiveTimeoutInterval <= 0) {
-        std::cout
-            << "CUVTcpClient: Invalid loop or timeout interval, cannot start receive timeout timer."
-            << std::endl;
+    if (!isLoopValid() || m_receiveTimeoutInterval <= 0) {
+        if (m_receiveTimeoutCallback) {
+            m_receiveTimeoutCallback("Receive timeout not set or invalid loop.");
+        }
         return;
     }
 
-    m_loop->postTask([this]() {
-        // 初始化接收超时定时器
-        if (!m_receiveTimeoutTimer) {
-            m_receiveTimeoutTimer = new uv_timer_t;
-            std::memset(m_receiveTimeoutTimer, 0, sizeof(uv_timer_t));
-            m_receiveTimeoutTimer->data = this;
-            if (int result = uv_timer_init(m_loop->getLoop(), m_receiveTimeoutTimer); result != 0) {
-                delete m_receiveTimeoutTimer;
-                m_receiveTimeoutTimer = nullptr;
-                std::cerr << "CUVTcpClient: Failed to initialize receive timeout timer: "
-                          << uv_strerror(result) << std::endl;
-                return;
+    postTask([this]() {
+        if (m_state.load() != ConnectState::CONNECTED) {
+            if (m_receiveTimeoutCallback) {
+                m_receiveTimeoutCallback("Client is not connected.");
             }
-        };
+            return;
+        }
 
-        // 启动接收超时定时器
-        uv_timer_start(
-            m_receiveTimeoutTimer,
+        // 使用通用定时器管理函数启动接收超时定时器
+        startTimer(
+            &m_receiveTimeoutTimer,
+            m_receiveTimeoutInterval,
             [](uv_timer_t* handle) {
                 CUVTcpClient* client = static_cast<CUVTcpClient*>(handle->data);
 
-                std::cout << "CUVTcpClient: Receive timeout occurred." << std::endl;
-
                 // 调用超时回调
                 if (client->m_receiveTimeoutCallback) {
-                    client->m_receiveTimeoutCallback();
+                    client->m_receiveTimeoutCallback("Receive timeout occurred.");
                 }
 
-                // 断开连接
+                // 断开连接并尝试重新连接
                 client->disconnect();
-                // 启动重连定时器
                 client->startReconnectTimer();
             },
-            m_receiveTimeoutInterval, // 延迟
-            0);                       // 不重复
+            "Failed to initialize receive timeout timer: ",
+            "Failed to start receive timeout timer: ",
+            m_receiveTimeoutCallback);
     });
 }
 
 void CUVTcpClient::stopReceiveTimeoutTimer()
 {
-    if (!m_loop || !m_receiveTimeoutTimer) {
+    if (!isLoopValid() || !m_receiveTimeoutTimer) {
         return;
     }
 
-    m_loop->postTask([this]() {
+    postTask([this]() {
         if (m_receiveTimeoutTimer) {
-            auto receiveTimeoutTimer = m_receiveTimeoutTimer;
-            m_receiveTimeoutTimer = nullptr;
-
-            uv_timer_stop(receiveTimeoutTimer);
-            uv_close(reinterpret_cast<uv_handle_t*>(receiveTimeoutTimer), [](uv_handle_t* handle) {
-                delete reinterpret_cast<uv_timer_t*>(handle);
-                handle = nullptr;
-            });
+            uv_timer_stop(m_receiveTimeoutTimer);
         }
     });
 }
 
-// ==================== TcpClientCallback 内部类实现 ====================
+// ==================== 辅助函数实现 ====================
+
+// 向事件循环发布任务
+template<typename Func>
+void CUVTcpClient::postTask(Func&& func) const
+{
+    if (isLoopValid()) {
+        m_loop->postTask(std::forward<Func>(func));
+    }
+}
+
+// 通用定时器管理函数
+template<typename CallbackFunc>
+bool CUVTcpClient::startTimer(uv_timer_t** timer_ptr,
+                              int interval_ms,
+                              CallbackFunc callback,
+                              const std::string& init_error_msg,
+                              const std::string& start_error_msg,
+                              std::function<void(const std::string&)>& timer_callback)
+{
+    if (!timer_ptr)
+        return false;
+
+    // 初始化定时器
+    if (!*timer_ptr) {
+        *timer_ptr = new uv_timer_t;
+        std::memset(*timer_ptr, 0, sizeof(uv_timer_t));
+        (*timer_ptr)->data = this;
+
+        if (uv_timer_init(m_loop->getLoop(), *timer_ptr) != 0) {
+            delete *timer_ptr;
+            *timer_ptr = nullptr;
+            if (timer_callback) {
+                timer_callback(init_error_msg + "failed");
+            }
+            return false;
+        }
+    }
+
+    // 先停止定时器，确保状态正确
+    uv_timer_stop(*timer_ptr);
+
+    // 启动定时器
+    if (uv_timer_start(*timer_ptr, callback, interval_ms, 0) != 0) {
+        if (timer_callback) {
+            timer_callback(start_error_msg + "failed");
+        }
+        return false;
+    }
+
+    return true;
+}
+
+// ==================== 静态回调函数实现 ====================
 
 // 连接回调处理
-void CUVTcpClient::TcpClientCallback::onConnect(uv_connect_t* req, int status)
+void CUVTcpClient::onConnect(uv_connect_t* req, int status)
 {
     ConnectRequest* req_data = static_cast<ConnectRequest*>(req->data);
     CUVTcpClient* client = req_data->client;
     bool success = (status == 0);
-    std::string error;
+    std::string error = success ? "" : uv_strerror(status);
 
     if (!success) {
-        error = uv_strerror(status);
         client->m_state.store(ConnectState::DISCONNECTED);
         // 连接失败，增加重连间隔
         client->m_reconnectInterval = (std::min) (client->m_reconnectInterval * 2,
                                                   client->m_maxReconnectInterval);
         // 启动重连定时器
         client->startReconnectTimer();
-
     } else {
         client->m_state.store(ConnectState::CONNECTED);
-
-        // 重置重连间隔
         client->m_reconnectInterval = client->m_initialReconnectInterval;
 
         // 开始接收数据
         uv_read_start(
             reinterpret_cast<uv_stream_t*>(client->m_tcpHandle),
             [](uv_handle_t*, size_t suggested_size, uv_buf_t* buf) {
-                // 分配缓冲区
                 buf->base = new char[suggested_size];
                 buf->len = (ULONG) suggested_size;
             },
-            [](uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
-                CUVTcpClient* client = static_cast<CUVTcpClient*>(stream->data);
-                client->m_callback.onReceive(stream, nread, buf);
-            });
+            CUVTcpClient::onReceive);
 
         // 重置接收超时定时器
         client->stopReceiveTimeoutTimer();
@@ -513,33 +561,28 @@ void CUVTcpClient::TcpClientCallback::onConnect(uv_connect_t* req, int status)
 }
 
 // 断开回调处理
-void CUVTcpClient::TcpClientCallback::onDisconnect(uv_handle_t* handle)
+void CUVTcpClient::onDisconnect(uv_handle_t* handle)
 {
-    CUVTcpClient* client = static_cast<CUVTcpClient*>(handle->data);
+    auto client = static_cast<CUVTcpClient*>(handle->data);
 
+    // 调用用户断开回调
     if (client->m_disconnectCallback) {
-        client->m_disconnectCallback();
+        client->m_disconnectCallback(true, "Disconnected successfully");
     }
 
     // 清理TCP句柄
     delete reinterpret_cast<uv_tcp_t*>(handle);
-    handle = nullptr;
 }
 
 // 发送回调处理
-void CUVTcpClient::TcpClientCallback::onSend(uv_write_t* req, int status)
+void CUVTcpClient::onSend(uv_write_t* req, int status)
 {
     SendRequest* req_data = static_cast<SendRequest*>(req->data);
-    bool success = (status == 0);
-    std::string error;
-
-    if (!success) {
-        error = uv_strerror(status);
-    }
 
     // 调用用户回调
     if (req_data->callback) {
-        req_data->callback(success, error);
+        std::string error = (status != 0) ? uv_strerror(status) : "";
+        req_data->callback(status == 0, error);
     }
 
     // 清理资源
@@ -548,32 +591,22 @@ void CUVTcpClient::TcpClientCallback::onSend(uv_write_t* req, int status)
 }
 
 // 接收回调处理
-void CUVTcpClient::TcpClientCallback::onReceive(uv_stream_t* stream,
-                                                ssize_t nread,
-                                                const uv_buf_t* buf)
+void CUVTcpClient::onReceive(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf)
 {
     CUVTcpClient* client = static_cast<CUVTcpClient*>(stream->data);
 
     if (nread > 0) {
-        // 有数据可读
         if (client->m_receiveCallback) {
             client->m_receiveCallback(buf->base, nread);
         }
-
         // 重置接收超时定时器
         client->stopReceiveTimeoutTimer();
         client->startReceiveTimeoutTimer();
     } else if (nread < 0) {
-        // 关闭超时定时器
-        client->stopReceiveTimeoutTimer();
-        // 断开连接
         client->disconnect();
-        // 启动重连定时器
         client->startReconnectTimer();
     }
 
     // 释放缓冲区
-    if (buf->base) {
-        delete[] buf->base;
-    }
+    delete[] buf->base;
 }
